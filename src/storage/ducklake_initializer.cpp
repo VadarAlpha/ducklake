@@ -32,13 +32,22 @@ string DuckLakeInitializer::GetAttachOptions() {
 			throw InternalException("Unsupported access mode in DuckLake attach");
 		}
 	}
+	bool has_isolation_level_override = false;
 	for (auto &option : options.metadata_parameters) {
 		attach_options.push_back(option.first + " " + option.second.ToSQLString());
+		if (StringUtil::Lower(option.first) == "isolation_level") {
+			has_isolation_level_override = true;
+		}
 	}
 	const string metadata_type = catalog.MetadataType();
 	if (metadata_type.empty() || metadata_type == "duckdb") {
 		// this is duckdb, we always do latest storage
 		attach_options.push_back(StringUtil::Format("STORAGE_VERSION '%s'", "latest"));
+	} else if ((metadata_type == "postgres" || metadata_type == "postgres_scanner") &&
+	           !has_isolation_level_override) {
+		// REPEATABLE READ pins one pg snapshot per DuckLake tx, hiding concurrent
+		// committers from CheckForConflicts. Override via meta_isolation_level.
+		attach_options.push_back("isolation_level 'read committed'");
 	}
 
 	if (attach_options.empty()) {
@@ -133,6 +142,9 @@ void DuckLakeInitializer::InitializeNewDuckLake(DuckLakeTransaction &transaction
 	}
 	auto &metadata_manager = transaction.GetMetadataManager();
 	metadata_manager.InitializeDuckLake(has_explicit_schema, catalog.Encryption());
+	if (auto *pg_mgr = dynamic_cast<PostgresMetadataManager *>(&metadata_manager)) {
+		pg_mgr->EnsureIdSequences();
+	}
 	if (catalog.Encryption() == DuckLakeEncryption::AUTOMATIC) {
 		// default to unencrypted
 		catalog.SetEncryption(DuckLakeEncryption::UNENCRYPTED);
@@ -213,6 +225,55 @@ void DuckLakeInitializer::LoadExistingDuckLake(DuckLakeTransaction &transaction)
 	for (auto &entry : metadata.table_settings) {
 		options.table_options[entry.table_id][entry.tag.key] = entry.tag.value;
 	}
+	if (options.access_mode != AccessMode::READ_ONLY) {
+		if (auto *pg_mgr = dynamic_cast<PostgresMetadataManager *>(&transaction.GetMetadataManager())) {
+			pg_mgr->EnsureIdSequences();
+		}
+	}
+	if (resolved_version != DuckLakeVersion::UNSET) {
+		SetVersionedMetadataManager(transaction, resolved_version);
+	}
+}
+
+DuckLakeVersion DuckLakeInitializer::ResolveTargetVersion(DuckLakeVersion catalog_version,
+                                                          const string &catalog_version_str) {
+	if (options.ducklake_version != DuckLakeVersion::UNSET) {
+		// If the user pinned a version, we use that
+		return options.ducklake_version;
+	}
+	if (options.automatic_migration) {
+		// If automatic_migration is on, use to latest
+		return DUCKLAKE_LATEST_VERSION;
+	}
+	if (catalog_version >= DuckLakeVersion::V1_0) {
+		// otherwise, use the catalog's current version (must be >= V1_0)
+		return catalog_version;
+	}
+	// pre-1.0 catalogs always require migration
+	throw InvalidInputException("DuckLake catalog version mismatch: catalog version is %s, but the extension requires "
+	                            "version %s. To automatically migrate, set AUTOMATIC_MIGRATION to TRUE when attaching.",
+	                            catalog_version_str, DuckLakeVersionToString(DUCKLAKE_LATEST_VERSION));
+}
+
+void DuckLakeInitializer::SetVersionedMetadataManager(DuckLakeTransaction &transaction, DuckLakeVersion version) {
+	if (version == DuckLakeVersion::V1_0) {
+		// base metadata managers are already V1.0, nop
+		return;
+	}
+	auto &current = transaction.GetMetadataManager();
+	unique_ptr<DuckLakeMetadataManager> new_manager;
+	if (version == DuckLakeVersion::V1_1_DEV_1) {
+		if (dynamic_cast<PostgresMetadataManager *>(&current)) {
+			new_manager = make_uniq<DuckLakeMetadataManagerV1_1<PostgresMetadataManager>>(transaction);
+		} else if (dynamic_cast<SQLiteMetadataManager *>(&current)) {
+			new_manager = make_uniq<DuckLakeMetadataManagerV1_1<SQLiteMetadataManager>>(transaction);
+		} else {
+			new_manager = make_uniq<DuckLakeMetadataManagerV1_1<DuckLakeMetadataManager>>(transaction);
+		}
+	} else {
+		throw InternalException("SetVersionedMetadataManager: unsupported version");
+	}
+	transaction.SetMetadataManager(std::move(new_manager));
 }
 
 } // namespace duckdb
