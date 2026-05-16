@@ -729,6 +729,7 @@ Connection &DuckLakeTransaction::GetConnection() {
 		// set max error reporting to 0 so that during error reporting we don't traverse other schemas / catalogs
 		auto &client_config = ClientConfig::GetConfig(*connection->context);
 		client_config.user_settings.SetUserSetting(CatalogErrorMaxSchemasSetting::SettingIndex, Value::UBIGINT(0));
+		connection->Query("SET default_transaction_invalidation_policy='SYNTACTIC_ERRORS_DO_NOT_INVALIDATE'");
 		connection->BeginTransaction();
 	}
 	return *connection;
