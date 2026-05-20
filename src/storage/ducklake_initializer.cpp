@@ -155,6 +155,12 @@ void DuckLakeInitializer::LoadExistingDuckLake(DuckLakeTransaction &transaction)
 	// load the data path from the existing duck lake
 	auto &metadata_manager = transaction.GetMetadataManager();
 	auto metadata = metadata_manager.LoadDuckLake();
+	// PR1113 cherry-pick: commit 9d807e19 (v1 backwards-compat plumbing) was
+	// skipped because it conflicts with v1.5-variegata's restructured v1.1 layer.
+	// Without it, no caller of ResolveTargetVersion() sets resolved_version, so
+	// the check at the end of this function is always false — same effective
+	// behavior as pre-PR1113.
+	DuckLakeVersion resolved_version = DuckLakeVersion::UNSET;
 	for (auto &tag : metadata.tags) {
 		if (tag.key == "version") {
 			string version = tag.value;
